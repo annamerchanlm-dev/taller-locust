@@ -1,218 +1,162 @@
-# Taller MLflow
+# Taller Locust — Capacidad de una API de inferencia con MLflow (1 vs. 3 réplicas)
 
-Este proyecto levanta con Docker Compose un entorno de MLflow para entrenar y servir un modelo que predice la especie de un pingüino a partir de sus medidas, la isla y el sexo. Los datos se guardan en una base de datos PostgreSQL (una tabla con los datos crudos y otra con los procesados), los experimentos se registran en MLflow usando otra base PostgreSQL distinta para su metadata, los modelos quedan guardados en MinIO, y una API en FastAPI hace la inferencia tomando el modelo desde el Model Registry de MLflow.
+Curso Operaciones de Machine Learning — Pontificia Universidad Javeriana — Nivel 3.
 
-## Servicios y puertos
+Este repositorio parte del **taller de MLflow** (PostgreSQL para metadata, MinIO para artefactos, JupyterLab para experimentar y una API FastAPI que toma el modelo `penguins-classifier@produccion` del Model Registry). Sobre esa base se publica la imagen de inferencia en Docker Hub, se despliega detrás de Nginx con réplicas limitadas a **1 CPU / 1 GB** y se mide su capacidad con **Locust** desde otra máquina.
 
-| Servicio | Contenedor | URL local | URL en la VM |
-|---|---|---|---|
-| MLflow | tm_mlflow | http://localhost:8001 | http://10.43.97.104:8001 |
-| Consola de MinIO | tm_minio | http://localhost:8002 | http://10.43.97.104:8002 |
-| API de MinIO (S3) | tm_minio | http://localhost:8003 | http://10.43.97.104:8003 |
-| JupyterLab | tm_jupyter | http://localhost:8004 | http://10.43.97.104:8004 |
-| API de inferencia | tm_api | http://localhost:8005/docs | http://10.43.97.104:8005/docs |
-| PostgreSQL de datos | tm_postgres_data | no se expone | no se expone |
-| PostgreSQL de metadata | tm_postgres_mlflow | no se expone | no se expone |
+## Arquitectura
 
-Las dos bases de datos no publican puertos hacia afuera porque solo las usan los otros contenedores dentro de la red de Docker.
-
-## Cómo levantarlo
-
-Clonar el repositorio y entrar a la carpeta:
-
-```
-git clone <url-del-repo>
-cd taller-mlflow
+```text
+PC Windows (generador)                     VM Javeriana 10.43.97.102 (4 vCPU, 15 GiB)
+┌────────────────────────┐   VPN    ┌──────────────────────────────────────────────────┐
+│ Docker Desktop         │ ───────▶ │ tm_nginx :8000 ─▶ api-1 (1 CPU / 1 GB)           │
+│ locustio/locust:2.46.7 │          │                ─▶ api-2 (1 CPU / 1 GB)  (×3)     │
+│ (12 CPU asignadas)     │          │                ─▶ api-3 (1 CPU / 1 GB)  (×3)     │
+└────────────────────────┘          │ tm_mlflow ─▶ tm_postgres_mlflow (metadata)       │
+                                    │           ─▶ tm_minio (artefactos del modelo)    │
+                                    │ tm_jupyter + tm_postgres_data → solo para entrenar│
+                                    └──────────────────────────────────────────────────┘
 ```
 
-Crear el archivo .env a partir de la plantilla:
+- Imagen publicada: **`annamerchanlm/penguins-api-mlflow:v1`** (digest `sha256:d8c7f0cb5558…`, 290 MB comprimida).
+- La API carga el modelo **una vez** desde MLflow/MinIO; después predice desde memoria.
 
-```
-cp .env.example .env
-```
+## Cambios frente al taller de MLflow
 
-Llenar los valores del .env. Las variables que hay que definir son:
+| Cambio | Archivo | Motivo |
+|---|---|---|
+| `build: ./api` → `image: annamerchanlm/penguins-api-mlflow:v1` | `docker-compose.yaml` | Desplegar la imagen publicada (puntos 2 y 3) |
+| Sin `container_name` ni `ports` en `api`; `expose: 8000` | `docker-compose.yaml` | Permitir `--scale api=3` |
+| `cpus: "${API_CPUS:-1.0}"`, `mem_limit: "${API_MEMORY:-1g}"` | `docker-compose.yaml` | Límite de 1 CPU / 1 GB **por réplica** |
+| Healthcheck que exige `modelo_cargado == true` | `docker-compose.yaml` | `/health` original responde 200 aunque no haya modelo; además fuerza la carga antes de recibir tráfico |
+| Servicio `nginx` (único puerto abierto: 8000) | `docker-compose.yaml`, `nginx/nginx.conf` | Balanceador entre réplicas |
+| `profiles: ["train"]` en `jupyter` y `postgres_data` | `docker-compose.yaml` | No compiten por CPU/RAM durante las pruebas |
+| MLflow, MinIO y Jupyter publicados solo en `127.0.0.1` | `docker-compose.yaml` | No exponerlos a la red de la universidad |
 
-- JUPYTER_UID: el id del usuario de Linux, se obtiene con id -u
-- JUPYTER_TOKEN: el token para entrar a JupyterLab
-- POSTGRES_DATA_USER, POSTGRES_DATA_PASSWORD, POSTGRES_DATA_DB: credenciales de la base de datos de los pingüinos
-- POSTGRES_MLFLOW_USER, POSTGRES_MLFLOW_PASSWORD, POSTGRES_MLFLOW_DB: credenciales de la base de metadata de MLflow
-- MINIO_ROOT_USER, MINIO_ROOT_PASSWORD: credenciales de MinIO, que también se usan como llaves de acceso S3
-- MINIO_BUCKET: nombre del bucket donde MLflow guarda los artefactos
+## Cómo reproducir
 
-Levantar todo:
-
-```
-docker compose up -d --build
-```
-
-La primera vez tarda varios minutos porque construye las imágenes de MLflow, JupyterLab y la API.
-
-Revisar que los servicios estén arriba:
-
-```
-docker compose ps
+```bash
+# VM
+git clone <este-repo> ~/taller-locust && cd ~/taller-locust
+cp .env.example .env            # llenar credenciales
+docker compose --profile train up -d --build      # entrenar: correr notebooks 01 y 02 en Jupyter
+docker compose stop jupyter postgres_data
+docker compose up -d --scale api=1                # o api=3
+./monitor_stats.sh <nombre>                       # registra docker stats con marca de tiempo
 ```
 
-```
-NAME                 IMAGE                        COMMAND                  SERVICE           CREATED         STATUS                            PORTS
-tm_api               taller-mlflow-api            "uvicorn main:app --…"   api               2 hours ago     Up 2 hours                        0.0.0.0:8005->8000/tcp, [::]:8005->8000/tcp
-tm_jupyter           taller-mlflow-jupyter        "tini -g -- start-no…"   jupyter           5 seconds ago   Up 2 seconds (health: starting)   0.0.0.0:8004->8888/tcp, [::]:8004->8888/tcp
-tm_minio             bitnamilegacy/minio:latest   "/opt/bitnami/script…"   minio             5 hours ago     Up 5 hours (healthy)              0.0.0.0:8003->9000/tcp, [::]:8003->9000/tcp, 0.0.0.0:8002->9001/tcp, [::]:8002->9001/tcp
-tm_mlflow            taller-mlflow-mlflow         "mlflow server --hos…"   mlflow            2 hours ago     Up 2 hours                        0.0.0.0:8001->5000/tcp, [::]:8001->5000/tcp
-tm_postgres_data     postgres:14                  "docker-entrypoint.s…"   postgres_data     5 hours ago     Up 5 hours (healthy)              5432/tcp
-tm_postgres_mlflow   postgres:14                  "docker-entrypoint.s…"   postgres_mlflow   5 hours ago     Up 5 hours (healthy)              5432/tcp
-```
-## Orden de ejecución de los notebooks
-
-Entrar a JupyterLab en el puerto 8004 con el token definido en el .env. Los notebooks están en la carpeta work y hay que correrlos en este orden:
-
-1. 01_carga_datos.ipynb: lee el CSV de pingüinos, lo carga sin procesar a la tabla raw.penguins_raw y luego guarda la versión procesada en clean.penguins_clean.
-2. 02_experimentos.ipynb: lee los datos desde clean.penguins_clean, entrena los modelos variando hiperparámetros, registra todo en MLflow y deja el modelo elegido en el Model Registry con el alias produccion.
-
-El segundo notebook necesita que el primero ya haya corrido, porque lee de la base de datos y no del CSV.
-
-## Evidencia de funcionamiento
-
-### Datos en las dos tablas
-
-Este comando muestra cuántas filas quedaron en la tabla de datos crudos y en la de procesados:
-
-```
-docker compose exec postgres_data psql -U penguins_user -d penguins_db -c "SELECT (SELECT COUNT(*) FROM raw.penguins_raw) AS crudos, (SELECT COUNT(*) FROM clean.penguins_clean) AS limpios;"
+```powershell
+# Máquina generadora (PowerShell), un nivel:
+docker run --rm -v ${PWD}:/mnt/locust locustio/locust:2.46.7 -f /mnt/locust/locustfile.py `
+  --headless --host http://10.43.97.102:8000 -u 110 -r 10 -t 131s --reset-stats `
+  --csv /mnt/locust/resultados/rep1v2_u110 --html /mnt/locust/resultados/rep1v2_u110.html
 ```
 
-El usuario y la base del comando salen de POSTGRES_DATA_USER y POSTGRES_DATA_DB del .env. Si los cambias, ajusta el comando.
+## Método
 
-```
- crudos | limpios
---------+---------
-    344 |     333
-(1 row)
-```
+| Parámetro (igual para 1 y 3 réplicas) | Valor |
+|---|---|
+| `locustfile.py` | `wait_time = between(1, 2.5)`; 3 pingüinos reales al azar; falla si no hay `especie_predicha` |
+| Spawn rate | 10 usuarios/s |
+| Ventana medida | 2 min **después** de crear todos los usuarios (`--reset-stats`; run time = usuarios/10 + 120 s) |
+| **Criterio "soporta"** | **< 1 % de fallos y p95 < 500 ms** en la ventana |
+| Generador | PC Windows por VPN; Locust 2.46.7 en Docker Desktop (12 CPU) |
 
-### Experimentos en MLflow
-![Runs del experimento en MLflow](https://github.com/user-attachments/assets/14bb5120-4011-4347-b062-0906fe2bf840)
+RPS = `Requests/s` del `*_stats.csv` de Locust. CPU/RAM = promedio de `docker stats` en la misma ventana.
 
-<img width="900" alt="Scatter plot de max_depth contra accuracy" src="https://github.com/user-attachments/assets/6523bd0f-cb65-49f7-a2d8-89b199be31d4" />
+## Resultados oficiales (Nginx v2, misma configuración para 1 y 3 réplicas)
 
-En la pestaña Models está el modelo registrado con sus dos versiones:
-<img width="900" alt="Modelo penguins-classifier con sus dos versiones" src="https://github.com/user-attachments/assets/f7c5a03c-ae66-4a9a-8338-2f0933265eb4" />
+### 1 réplica (1 CPU / 1 GB)
 
-El detalle de la versión 2, que es la que tiene el alias produccion:
-<img width="900" alt="Detalle de la version 2 con el alias produccion" src="https://github.com/user-attachments/assets/69c715e4-f8c1-4a00-beaf-22b20dbbeaef" />
+| Usuarios | RPS | Peticiones | Fallos | p50 | **p95** | p99 | CPU réplica | RAM réplica | Cumple |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| **110** | **54,1** | 6.847 | 0 % | 150 ms | **430 ms** | 550 ms | 89 % | 181 MiB | ✅ |
+| 120 | 55,9 | 7.087 | 0 % | 250 ms | 610 ms | 1.000 ms | 93 % | 181 MiB | ❌ |
+| 130 | 57,5 | 7.276 | 0 % | 390 ms | 710 ms | 910 ms | 98 % | 181 MiB | ❌ |
+| 140 | 58,1 | 7.310 | 0 % | 530 ms | 840 ms | 1.000 ms | 100 % | 182 MiB | ❌ |
 
-El esquema de entrada que muestra MLflow son las seis variables que recibe la API, y el alias produccion es el que aparece en el campo modelo de las respuestas de /predict.
+### 3 réplicas (1 CPU / 1 GB cada una)
 
-### Artefactos en MinIO
+| Usuarios | RPS | Peticiones | Fallos | p50 | **p95** | p99 | CPU por réplica | CPU total API | RAM por réplica | Cumple |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| 330 | 172,4 | 21.361 | 0 % | 62 ms | 180 ms | 310 ms | 64 % | 191 % | 172 MiB | ✅ |
+| 360 | 185,4 | 23.504 | 0 % | 68 ms | 280 ms | 410 ms | 68 % | 205 % | 172 MiB | ✅ |
+| 400 | 204,0 | 25.829 | 0 % | 87 ms | 290 ms | 400 ms | 76 % | 227 % | 173 MiB | ✅ |
+| 440 | 222,9 | 28.318 | 0 % | 100 ms | 300 ms | 460 ms | 80 % | 241 % | 173 MiB | ✅ |
+| **480** | **230,2** | 29.626 | 0 % | 200 ms | **420 ms** | 560 ms | 84 % | 253 % | 173 MiB | ✅ |
+| 540 | 231,9 | 29.511 | 0 % | 350 ms | 880 ms | 4.300 ms | 84 % | 251 % | 174 MiB | ❌ |
 
-En MinIO está el bucket donde MLflow guarda los artefactos. Las carpetas 1 y 2 son los dos experimentos:
-<img width="900" alt="Bucket mlflow-artifacts en MinIO" src="https://github.com/user-attachments/assets/9a644637-84dc-495c-800b-c229a18a4313" />
+![p95 vs usuarios](resultados/graficas/p95_vs_usuarios.png)
+![RPS vs usuarios](resultados/graficas/rps_vs_usuarios.png)
+![CPU por réplica](resultados/graficas/cpu_por_replica.png)
 
-Dentro de cada experimento hay una carpeta por ejecución, con el modelo y sus archivos:
-<img width="900" alt="Carpetas de los runs dentro del experimento 2" src="https://github.com/user-attachments/assets/6c13bef6-a818-4007-93c7-735f34fc47b7" />
+Tabla completa (incluye CPU de Nginx, MLflow, MinIO y Postgres por corrida): [`resultados/tabla_resultados.csv`](resultados/tabla_resultados.csv). Reportes HTML de Locust: `resultados/*.html`.
 
-Son 378 objetos en total, que corresponden a los modelos de los 54 runs con sus archivos asociados. Los nombres de las carpetas son los identificadores de cada ejecución, y la relación entre esos identificadores y los parámetros de cada run está en la base de metadata de MLflow.
+## Respuestas
 
+**1. Concurrencia máxima sostenible y RPS con 1 réplica (1 CPU / 1 GB).**
+**110 usuarios, 54,1 RPS** (p95 430 ms, 0 fallos). Con 120 usuarios el RPS casi no sube (55,9) y el p95 pasa a 610 ms. El techo de la réplica es **≈ 58 RPS**, con la CPU al 100 %.
 
-### Inferencia con la API
+**2. Concurrencia máxima sostenible y RPS con 3 réplicas.**
+**480 usuarios, 230,2 RPS** (p95 420 ms, 0 fallos). Con 540 usuarios se procesan las mismas peticiones (29.511 vs. 29.626) y el p95 sube a 880 ms: el techo es **≈ 231 RPS**.
 
-Revisar que la API tenga el modelo cargado:
+**3. ¿En qué porcentaje cambió la capacidad? ¿Fue cercano a 3×?**
 
-```
-curl -s http://localhost:8005/health
-```
+| | 1 réplica | 3 réplicas | Cambio |
+|---|---:|---:|---:|
+| Usuarios sostenibles | 110 | 480 | **+336 % (×4,4)** |
+| RPS en el límite | 54,1 | 230,2 | **+325 % (×4,3)** |
+| Techo de RPS | 58,1 | 231,9 | +299 % (×4,0) |
 
-```
-{"estado":"ok","modelo_cargado":true,"uri":"models:/penguins-classifier@produccion"}
-```
+El aumento **superó 3×**. Hay dos efectos medidos:
+- **Cola compartida.** Con 3 servidores y una sola fila (Nginx reparte a la réplica libre), la latencia aguanta mucho mejor cerca del límite que con 1 servidor. Por eso, con el mismo p95, se sostienen proporcionalmente más usuarios.
+- **Menos CPU por petición.** `CPU total de la API ÷ RPS` da **15,5–17,2 ms por petición con 1 réplica** y **10,8–11,1 ms con 3 réplicas**, incluso a carga baja (1 réplica con 26,5 RPS: 15,7 ms; 3 réplicas con 26,5 RPS cada una: 12,9 ms). No logramos aislar la causa con los datos disponibles; la hipótesis es el costo de concentrar todas las conexiones keep-alive de Nginx y toda la cola en un solo proceso uvicorn (un solo hilo de ejecución por el GIL). Queda como trabajo futuro medir con `perf`/`py-spy` dentro de la réplica.
 
-Pedir una predicción:
+A la vez aparece **otro cuello de botella**: con 3 réplicas, ninguna llegó a su límite (se estancaron en **~84 %** con 480 y 540 usuarios), así que el techo de 231 RPS **no lo puso la CPU de las réplicas**.
 
-```
-curl -s -X POST http://localhost:8005/predict -H "Content-Type: application/json" -d '{"culmen_length_mm": 39.1, "culmen_depth_mm": 18.7, "flipper_length_mm": 181, "body_mass_g": 3750, "island": "Torgersen", "sex": "MALE"}'
-```
+**4. ¿Qué recurso se saturó primero y qué evidencia hay?**
+- **1 réplica: la CPU de la réplica.** `docker stats` la muestra en **99,7 %** con 140 usuarios mientras el RPS se aplana en 58. La RAM nunca fue el límite: **181 MiB de 1 GiB (18 %)**.
+- **3 réplicas: un recurso compartido de la VM.** Las réplicas se quedaron en ~84 % y la suma de todos los contenedores fue ~258 % de los 400 % (4 vCPU) de la VM. `docker stats` no muestra el CPU del host (red del kernel/NAT de Docker, `dockerd`, el propio monitoreo con `docker stats`), y esa es la explicación más probable de la diferencia; confirmarlo requiere `mpstat`/`top` en la VM durante la prueba. RAM por réplica: 173 MiB (17 %).
+- **Locust (generador):** sin ninguna advertencia `CPU usage above 90%` en ninguna corrida, incluida la de 540 usuarios (~232 RPS). El límite medido es del servicio, no del generador.
+- **Red/VPN:** con 1 solo usuario la mediana fue 110 ms; es el piso de latencia que pone la VPN, que deja ~390 ms de margen al criterio.
 
-```
-{"especie_predicha":"Adelie","modelo":"models:/penguins-classifier@produccion"}
-```
+**5. ¿Qué servicios adicionales pudieron limitar el resultado?**
+- **Nginx (balanceador) — sí limitó, y es el hallazgo principal.** Con su configuración por defecto (`max_fails=1`, `fail_timeout=10s`), cada reset de una conexión keep-alive (`recv() failed (104)`) sacaba una réplica del grupo durante 10 s. Con 3 réplicas eso produjo `no live upstreams`: **73 errores 502 en ráfaga** y p95 de 570 ms con 330 usuarios. Con 1 réplica no pasa porque Nginx ignora `max_fails` cuando hay un solo servidor. Tras ajustar `max_fails=3 fail_timeout=5s` y `keepalive_timeout 4s` (menor que los 5 s de uvicorn), el mismo nivel dio **0 fallos y p95 de 180 ms**, y el límite de 3 réplicas pasó de **300 a 480 usuarios**. Antes de las corridas oficiales también se subió `worker_connections` (512 por defecto) a 4096: en la exploración aparecieron conexiones cortadas (`HTTP 0`) por encima de ~250 usuarios, consistente con ese límite, aunque no se confirmó en los logs.
+- **MLflow, MinIO y PostgreSQL — no limitaron el throughput.** Durante la carga: MLflow **0,0 % de CPU**, MinIO ≤ 1,1 %, Postgres ≤ 1,7 %. No están en el camino de cada petición: la API los usa solo al arrancar. Su impacto real es otro:
+  - **Tiempo de arranque/escalado:** cada réplica nueva tardó ~9 s en quedar `healthy` (resolver el alias en MLflow + descargar el modelo de MinIO).
+  - **Dependencia:** si MLflow no está disponible, una réplica nueva no carga el modelo, queda `unhealthy` y no recibe tráfico.
+  - **Memoria compartida:** MLflow ocupa **532–585 MiB en reposo, ~3× una réplica de la API**, en la misma VM de 4 vCPU donde corren las réplicas.
 
-Otra predicción con medidas distintas:
+## Resultados con la configuración original de Nginx (v1) — evidencia del hallazgo
 
-```
-curl -s -X POST http://localhost:8005/predict -H "Content-Type: application/json" -d '{"culmen_length_mm": 49.1, "culmen_depth_mm": 14.8, "flipper_length_mm": 220, "body_mass_g": 5150, "island": "Biscoe", "sex": "FEMALE"}'
-```
+| Réplicas | Usuarios | RPS | Fallos | p95 | Cumple |
+|---:|---:|---:|---:|---:|:---:|
+| 1 | 50 | 26,5 | 0 | 110 ms | ✅ |
+| 1 | 100 | 51,1 | 0 | 310 ms | ✅ |
+| 1 | 110 | 55,2 | 1 (0,01 %) | 330 ms | ✅ |
+| 1 | 120 | 55,9 | 1 (0,01 %) | 550 ms | ❌ |
+| 3 | 150 | 79,4 | 0 | 110 ms | ✅ |
+| 3 | 300 | 154,9 | 1 (0,005 %) | 320 ms | ✅ |
+| 3 | 330 | 157,2 | **73 (0,29 %)** | **570 ms** | ❌ |
 
-```
-{"especie_predicha":"Gentoo","modelo":"models:/penguins-classifier@produccion"}
-```
+Con 1 réplica el resultado v1 y v2 coincide (110 usuarios), lo que confirma que el ajuste de Nginx solo cambia el escenario con varias réplicas.
 
-Las medidas de la primera petición corresponden a un pingüino Adelie del dataset y las de la segunda a un Gentoo, así que las dos predicciones son correctas.
-También se puede probar desde el navegador en http://10.43.97.104:8005/docs, que es la documentación que genera FastAPI.
+## Otras observaciones
 
-<img width="900" alt="Prediccion ejecutada desde la documentacion de la API" src="https://github.com/user-attachments/assets/12033524-d4a0-4304-bcc6-66d7fce34e03" />
+- **`joblib` dentro del contenedor ve 1 CPU**, así que el `n_jobs=-1` del RandomForest no genera hilos de más.
+- **scikit-learn 1.3.1** tanto en Jupyter (entrenamiento) como en la API (inferencia).
+- Hubo tropiezos transitorios de latencia de 10–15 s (p95 de 3–4 s) en algunas corridas, con el RPS cayendo al mismo tiempo; afectan el p99 y en 540 usuarios el máximo, pero no cambian ningún veredicto.
+- El reloj de la VM y el de la máquina generadora no están sincronizados (~12 s según los logs de Nginx); los datos se alinearon por correlación entre la CPU de la API y el RPS de Locust.
+- Una petición tardó 35,9 s en el nivel 440 (3 réplicas) con p99 de 460 ms: valor atípico aislado, por eso el criterio usa p95.
 
+## Archivos
 
-### Dos observaciones sobre los resultados
-
-Con las seis variables (las cuatro medidas más isla y sexo) casi todos los modelos dieron exactitud de 1.0 sobre el conjunto de prueba, así que los hiperparámetros no cambiaban nada. El problema resultó demasiado fácil para este dataset. Por eso corrí un segundo experimento usando solo dos variables (culmen_depth_mm y body_mass_g), que son las menos discriminantes, y ahí sí se ve diferencia entre configuraciones: la exactitud baja y los modelos con max_depth=10 quedan peor que los de max_depth=3, que entiendo como sobreajuste.
-
-Primer experimento, con las seis variables:
-```
-[01/27] n=50 d=3 s=2 -> acc=1.0000 f1=1.0000
-[02/27] n=50 d=3 s=5 -> acc=1.0000 f1=1.0000
-[03/27] n=50 d=3 s=10 -> acc=1.0000 f1=1.0000
-[07/27] n=50 d=10 s=2 -> acc=0.9851 f1=0.9873
-[27/27] n=200 d=10 s=10 -> acc=1.0000 f1=1.0000
-```
-
-Segundo experimento, solo con dos variables:
-```
-[01/27] n=50 d=3 s=2 -> acc=0.7910 f1=0.6019
-[04/27] n=50 d=5 s=2 -> acc=0.7612 f1=0.5905
-[07/27] n=50 d=10 s=2 -> acc=0.7164 f1=0.6010
-[16/27] n=100 d=10 s=2 -> acc=0.7164 f1=0.6010
-[27/27] n=200 d=10 s=10 -> acc=0.7761 f1=0.6334
-```
-También quedaron dos versiones del modelo en el registro. La primera la registré ordenando los runs con order_by de search_runs, pero MLflow guarda los parámetros como texto y el orden salió alfabético en vez de numérico ("100" antes que "50", "10" antes que "3"), así que eligió uno de los modelos más complejos. En la versión 2 hice el ordenamiento en Python convirtiendo los parámetros a entero, y ahí sí quedó el más simple entre los empatados. Dejé las dos versiones en vez de borrar la primera, porque la idea del registro es que quede el historial. El alias produccion apunta a la versión 2.
-
-```
-Empatados en accuracy maxima: 26
-Mas simple entre ellos: rf_03_n50_d3_s10
-  n_estimators=50, max_depth=3, min_samples_split=10
-
-Registrado como version 2
-```
-## Cómo cambiar el modelo que usa la API
-
-La API no apunta a un archivo sino al alias produccion del Model Registry, como se ve en la variable MODELO_URI del docker-compose.yaml:
-
-```
-MODELO_URI: models:/penguins-classifier@produccion
-```
-
-Para poner otro modelo en producción hay dos pasos.
-
-Primero, mover el alias a la versión que se quiera, desde la interfaz de MLflow (pestaña Models, en la versión correspondiente) o desde Python:
-```
-from mlflow.tracking import MlflowClient
-
-client = MlflowClient()
-client.set_registered_model_alias(
-    name="penguins-classifier",
-    alias="produccion",
-    version=3,
-)
-```
-
-Segundo, pedirle a la API que vuelva a cargar el modelo, porque lo guarda en memoria después de la primera carga:
-
-```
-curl -s -X POST http://localhost:8005/reload
-```
-
-No hay que reiniciar el contenedor ni cambiar el código de la API.
-
-```
-{"mensaje":"Modelo recargado desde MLflow","uri":"models:/penguins-classifier@produccion"}
-```
+| Ruta | Contenido |
+|---|---|
+| `docker-compose.yaml`, `nginx/nginx.conf` | Despliegue de la VM |
+| `locust/locustfile.py` | Prueba de carga |
+| `monitor_stats.sh` | Registro de `docker stats` con marca de tiempo |
+| `resultados/rep1v2_*`, `resultados/rep3v2_*` | Corridas oficiales (CSV + HTML) |
+| `resultados/rep1_*`, `resultados/rep3_*` | Corridas con Nginx v1 |
+| `resultados/*_docker.csv` | CPU/RAM por contenedor durante cada barrido |
+| `resultados/tabla_resultados.csv`, `resultados/graficas/` | Tabla consolidada y gráficas |

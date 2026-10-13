@@ -3,6 +3,7 @@ services:
   postgres_data:
     image: postgres:14
     container_name: tm_postgres_data
+    profiles: ["train"]                     # CAMBIO: solo se levanta para entrenar
     environment:
       POSTGRES_USER: ${POSTGRES_DATA_USER}
       POSTGRES_PASSWORD: ${POSTGRES_DATA_PASSWORD}
@@ -41,8 +42,8 @@ services:
       MINIO_BROWSER: "on"
       MINIO_CONSOLE_PORT_NUMBER: "9001"
     ports:
-      - "8003:9000"
-      - "8002:9001"
+      - "127.0.0.1:8003:9000"               # CAMBIO: solo accesible desde la VM
+      - "127.0.0.1:8002:9001"               # CAMBIO
     volumes:
       - minio_data:/bitnami/minio/data
     healthcheck:
@@ -66,7 +67,7 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "8001:5000"
+      - "127.0.0.1:8001:5000"               # CAMBIO: solo accesible desde la VM
     depends_on:
       postgres_mlflow:
         condition: service_healthy
@@ -77,6 +78,7 @@ services:
   jupyter:
     build: ./jupyter
     container_name: tm_jupyter
+    profiles: ["train"]                     # CAMBIO: solo se levanta para entrenar
     user: root
     environment:
       NB_UID: ${JUPYTER_UID}
@@ -90,7 +92,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       DATA_DB_CONN: postgresql+psycopg2://${POSTGRES_DATA_USER}:${POSTGRES_DATA_PASSWORD}@postgres_data:5432/${POSTGRES_DATA_DB}
     ports:
-      - "8004:8888"
+      - "127.0.0.1:8004:8888"               # CAMBIO: solo accesible desde la VM
     volumes:
       - ./notebooks:/home/jovyan/work
       - ./data:/home/jovyan/data:ro
@@ -102,20 +104,44 @@ services:
     restart: always
 
   api:
-    build: ./api
-    container_name: tm_api
+    image: annamerchanlm/penguins-api-mlflow:v1   # CAMBIO: imagen publicada, ya no build
+    # CAMBIO: sin container_name y sin ports, para permitir --scale api=3
+    expose:
+      - "8000"
+    cpus: "${API_CPUS:-1.0}"                # CAMBIO: límite de CPU por réplica
+    mem_limit: "${API_MEMORY:-1g}"          # CAMBIO: límite de RAM por réplica
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       MODELO_URI: models:/penguins-classifier@produccion
-    ports:
-      - "8005:8000"
+    healthcheck:                            # CAMBIO: sana solo si el modelo está cargado
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; r=json.load(urllib.request.urlopen('http://localhost:8000/health', timeout=4)); sys.exit(0 if r.get('modelo_cargado') else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     depends_on:
       mlflow:
         condition: service_started
-    restart: always
+    restart: unless-stopped
+
+  nginx:                                    # CAMBIO: servicio nuevo, balanceador
+    image: nginx:1.27.5-alpine
+    container_name: tm_nginx
+    ports:
+      - "8000:8000"                         # el único puerto abierto a la red
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ulimits:                                # CAMBIO: permite miles de conexiones abiertas
+      nofile:
+        soft: 65535
+        hard: 65535
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:
