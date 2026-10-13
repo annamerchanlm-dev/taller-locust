@@ -1,6 +1,5 @@
 # Taller Locust — Capacidad de una API de inferencia con MLflow (1 vs. 3 réplicas)
 
-Curso Operaciones de Machine Learning — Pontificia Universidad Javeriana — Nivel 3.
 
 Este repositorio parte del **taller de MLflow** (PostgreSQL para metadata, MinIO para artefactos, JupyterLab para experimentar y una API FastAPI que toma el modelo `penguins-classifier@produccion` del Model Registry). Sobre esa base se publica la imagen de inferencia en Docker Hub, se despliega detrás de Nginx con réplicas limitadas a **1 CPU / 1 GB** y se mide su capacidad con **Locust** desde otra máquina.
 
