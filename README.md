@@ -148,6 +148,41 @@ Con 1 réplica el resultado v1 y v2 coincide (110 usuarios), lo que confirma que
 - El reloj de la VM y el de la máquina generadora no están sincronizados (~12 s según los logs de Nginx); los datos se alinearon por correlación entre la CPU de la API y el RPS de Locust.
 - Una petición tardó 35,9 s en el nivel 440 (3 réplicas) con p99 de 460 ms: valor atípico aislado, por eso el criterio usa p95.
 
+## Evidencias (capturas de la interfaz de Locust y Docker Hub)
+
+**Imagen publicada en Docker Hub** (digest idéntico al ID de la imagen probada en la VM):
+
+![Docker Hub tag v1](evidencias/01_dockerhub_tag_v1.png)
+
+**Exploración con 1 réplica (0 → 400 usuarios):** el RPS se aplana en ~60 mientras los usuarios siguen subiendo y el p50/p95 se disparan; es la forma típica de la saturación.
+
+![Exploración 1 réplica](evidencias/03_exploracion_1rep_charts.png)
+
+**Límite de 1 réplica:** 110 usuarios cumple; 120 ya no (p95 550 ms con RPS plano).
+
+![1 réplica, 110 usuarios](evidencias/14_rep1v1_u110_charts.png)
+![1 réplica, 120 usuarios](evidencias/17_rep1v1_u120_charts.png)
+
+**Hallazgo de Nginx (v1):** 330 usuarios con 3 réplicas, 73 errores 502 concentrados en ~45 s (`no live upstreams`)...
+
+![3 réplicas, 330 usuarios, Nginx v1](evidencias/25_rep3v1_u330_charts.png)
+![Fallos 502 con Nginx v1](evidencias/27_rep3v1_u330_failures_no_live_upstreams.png)
+
+...y el mismo nivel con Nginx v2: 0 fallos, p95 180 ms.
+
+![3 réplicas, 330 usuarios, Nginx v2](evidencias/30_rep3v2_u330_charts.png)
+
+**Límite de 3 réplicas:** 480 usuarios cumple; con 540 el RPS no sube y el p95 llega a 880 ms.
+
+![3 réplicas, 480 usuarios](evidencias/39_rep3v2_u480_charts.png)
+![3 réplicas, 540 usuarios](evidencias/41_rep3v2_u540_charts.png)
+
+**Generador sin saturar:** la pestaña LOGS de Locust (440 usuarios) no muestra advertencias de CPU.
+
+![Logs de Locust](evidencias/38_rep3v2_u440_logs_sin_alerta_cpu.png)
+
+Todas las capturas (gráficas, estadísticas y fallos de cada nivel) están en [`evidencias/`](evidencias/): prefijo `rep1v1`/`rep3v1` = Nginx original, `rep1v2`/`rep3v2` = Nginx corregido. Los niveles de 1 réplica con Nginx v2 (110–140) se corrieron en modo *headless*; su evidencia visual son los reportes `resultados/rep1v2_u*.html`.
+
 ## Archivos
 
 | Ruta | Contenido |
@@ -159,3 +194,4 @@ Con 1 réplica el resultado v1 y v2 coincide (110 usuarios), lo que confirma que
 | `resultados/rep1_*`, `resultados/rep3_*` | Corridas con Nginx v1 |
 | `resultados/*_docker.csv` | CPU/RAM por contenedor durante cada barrido |
 | `resultados/tabla_resultados.csv`, `resultados/graficas/` | Tabla consolidada y gráficas |
+| `evidencias/` | Capturas de Locust (gráficas, estadísticas, fallos, logs) y Docker Hub |
